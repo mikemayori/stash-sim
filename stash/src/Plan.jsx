@@ -1,141 +1,192 @@
-const PORTFOLIO_DOC = `// db.userportfolios — one document per user (unchanged shape + one field)
-{
-  userId: "u_1001",
-  balances: {                       // MAIN — the only bucket the balance selector reads
-    usdt: { total: 40,  bonus: 0, original: 40 },
-    eth:  { total: 1.5, bonus: 1, original: 0.5 },
-    ...
-  },
-  stashBalances: {                  // NEW — same UserPortfolioBalances sub-schema
-    usdt: { total: 60, bonus: 0, original: 60 },   // invariant: bonus is always 0
-    ...
+const STORAGE = `// Mongo mongo0.user_altcoin_portfolios — 8 balance types (usdt, usdc, xrp, doge, trx, sol, bnb, sui)
+balances: {
+  usdt: {
+    balance: 40,              // primary — the only amount that is wagered or withdrawn
+    bonusBalance: 0,
+    stashBalance: 60,         // NEW
+    currency: "usd",          // every amount is USD, stored as a float Number
+    originalBalance, originalBonusBalance,
+    originalStashBalance      // NEW scratch field, same role as the two above
   }
-}`;
-
-const TX_DOCS = `// db.transactions — appended fields (all additive, back-fill balanceType: "MAIN")
-{
-  _id, userId, createdAt,
-  type:        "STASH_IN" | "STASH_OUT" | "ADMIN_STASH_ADD"
-             | "ADMIN_STASH_CONFISCATE" | "ADMIN_STASH_RESET" | ...existing,
-  currency:    "usdt",
-  balanceType: "MAIN" | "STASH",       // the bucket THIS row changes
-  amount:      Decimal128("-60"),      // signed, from the bucket's point of view
-  transferId:  ObjectId,               // NEW — links the two legs of one transfer
-  leg:         "DEBIT" | "CREDIT",     // NEW
-  idempotencyKey: "client-uuid",       // NEW — unique per user, kills double-submits
-  meta: { source: "user" | "autoReload" | "admin",
-          adminId?, reason?, previousTotal?, trigger? }
 }
 
-// one transferToStash(60 USDT) =
-{ type: "STASH_IN", balanceType: "MAIN",  amount: -60, leg: "DEBIT",  transferId: T }
-{ type: "STASH_IN", balanceType: "STASH", amount: +60, leg: "CREDIT", transferId: T }
+// RethinkDB users row — the other 4 balance types (crypto = BTC, eth, ltc, cash)
+balance, ethBalance, ltcBalance, cashBalance                           // existing
+btcBonusBalance, ethBonusBalance, ltcBonusBalance, cashBonusBalance    // existing
+btcStashBalance, ethStashBalance, ltcStashBalance, cashStashBalance    // NEW`;
 
-// indexes
-{ userId: 1, balanceType: 1, currency: 1, createdAt: -1 }
-{ transferId: 1 }
-{ userId: 1, idempotencyKey: 1 }  unique, partial (idempotencyKey exists)`;
+const TRANSFER_QUERY = `// Portfolio types: one findOneAndUpdate, pipeline update, guard inside the update.
+// No Mongo session: nothing in the backend uses one at runtime.
+UserPortfolioModel.findOneAndUpdate({ userId }, [
+  { $set: {
+      "balances.usdt.originalBalance":      { $ifNull: ["$balances.usdt.balance", 0] },
+      "balances.usdt.originalStashBalance": { $ifNull: ["$balances.usdt.stashBalance", 0] } } },
+  { $set: { "balances.usdt.canMove": { $gte: ["$balances.usdt.originalBalance", amount] } } },
+  { $set: {
+      "balances.usdt.balance": { $cond: ["$balances.usdt.canMove",
+          { $subtract: ["$balances.usdt.originalBalance", amount] }, "$balances.usdt.originalBalance"] },
+      "balances.usdt.stashBalance": { $cond: ["$balances.usdt.canMove",
+          { $add: ["$balances.usdt.originalStashBalance", amount] }, "$balances.usdt.originalStashBalance"] } } },
+  { $unset: "balances.usdt.canMove" }
+], { new: true })
+// The app compares original* with the new values to detect a no-op (existing ledger pattern).
 
-const TRANSFER_QUERY = `// Both buckets live in ONE document, so the move itself is a single atomic op.
-// The session is only needed to commit the ledger rows with it.
-session.withTransaction(async () => {
-  const doc = await UserPortfolio.findOneAndUpdate(
-    { userId, "balances.usdt.original": { $gte: 60 } },     // overdraft guard IN the filter
-    { $inc: { "balances.usdt.total": -60, "balances.usdt.original": -60,
-              "stashBalances.usdt.total": 60, "stashBalances.usdt.original": 60 } },
-    { session, new: true });
-  if (!doc) throw new InsufficientBalance();
-  await Transaction.insertMany([debitLeg, creditLeg], { session });
-});`;
+// User-object types: one RethinkDB .update() with
+// r.branch(doc(field).ge(amount), { both fields }, {}) and returnChanges.`;
+
+const TX_DOCS = `// mongo0.transactions — no new top-level fields, no new indexes (the collection is index-frozen)
+{ userId, type, amount, currentBalance, balanceType, meta, createdAt }
+
+// NEW type values:        "stashIn" | "stashOut"
+// NEW balanceType values: "<BalanceType>Stash", e.g. "usdtStash" (copies "usdtBonus")
+
+// one transfer of 60 into Stash on usdt = two rows
+{ type: "stashIn", balanceType: "usdtStash", amount: +60, currentBalance: <stash after>,
+  meta: { transferId, source: "user" } }
+{ type: "stashIn", balanceType: "usdt",      amount: -60, currentBalance: <primary after>,
+  meta: { transferId, source: "user" } }
+
+meta: { transferId: "<uuid>",                    // links the two rows; not indexed
+        source: "user" | "admin" | "reload",
+        requestId?,                              // only if the retry check is added
+        adminId?, reason? }                      // admin transfers only`;
+
+const STORIES = [
+  ['Ledger readers: <BalanceType>Stash in the balance-type validator; stashIn / stashOut in the four compile-time places, no-op stats. Deployed one release ahead of any writer', 2],
+  ['Storage and atomic move: stashBalance in the portfolio schema, four user-row fields, guarded transfer in both DALs, two rows, alert on failed row write, Mongo integration test', 5],
+  ['Read model: <type>Stash keys in UserBalances behind the flag, GraphQL fields, Connect API filter, account-cleanup filter, test that wagering excludes Stash', 3],
+  ['Player transfer in: mutation, flag and allow-list, mutex, match-promo and bonus guards, error keys and locales', 3],
+  ['Player transfer out: mutation, check2faIfEnabled, wrong-code limiter', 3],
+  ['Side effects: FastTrack handling of Stash rows; transactionCreated and history labels agreed with the web client', 2],
+  ['ACP backend: admin transfer mutations, RBAC actions, reason enum, audits record, user note, Slack log, audit query', 5],
+  ['Data: BigQuery liability views and warehouse, with Data Engineering', 2],
+  ['Player UI: Stash view, transfer dialogs, 2FA prompt and warning (client repo, not examined)', 5],
+  ['ACP UI: Stash column, transfer controls, reason dropdown, audit view (client repo, not examined)', 3],
+  ['Manual reload: settings per balance type, client prompt', 3],
+  ['(later, flagged) Auto-reload in the bet path', 8],
+];
 
 export default function Plan() {
   return (
     <div className="panel plan">
-      <h3>1 · Decision: where the Stash balance lives</h3>
       <div className="callout">
-        Store Stash as a <code>stashBalances</code> sub-document on the existing <code>UserPortfolio</code>, reusing the
-        <code> UserPortfolioBalances</code> sub-schema. Record every movement in <code>transactions</code> with
-        <code> currency</code> + <code>balanceType</code>, as <strong>paired debit/credit legs</strong>.
+        <strong>Draft 2.</strong> Rewritten against <code>STASH_CODEBASE_FINDINGS.md</code>, a read-only investigation of the
+        backend. The full text, with a reference to the findings for every claim, is in <code>TECHNICAL_PLAN.md</code>.
+        The Simulator and Test scenarios tabs run this design; section 9 says how they map to it.
       </div>
-      <ul>
-        <li><strong>Why the same document:</strong> Main and Stash sit in one doc, so a transfer is one <code>findOneAndUpdate</code>. It's atomic even without a session, and the overdraft guard goes in the filter. This mirrors how Bonus sits beside Original today, so the complexity is about the same as Bonus Balance.</li>
-        <li><strong>Rejected: separate <code>stashportfolios</code> collection.</strong> Every transfer becomes a multi-document transaction, and the ACP needs two reads per user.</li>
-        <li><strong>Deferred: balance derived from the ledger.</strong> That belongs to the double-entry / Postgres epic. The paired legs below make the later migration a replay rather than a rewrite.</li>
-        <li><strong>Money type:</strong> use <code>Decimal128</code>, not JS numbers. BTC at 8dp drifts under float <code>$inc</code>.</li>
-      </ul>
-      <pre>{PORTFOLIO_DOC}</pre>
 
-      <h3>2 · Data model appended to <code>transactions</code></h3>
-      <pre>{TX_DOCS}</pre>
-      <p><strong>Change from the spec: two legs, not one row.</strong> The spec writes a single <code>STASH_IN</code> tagged <code>STASH</code>, and a single <code>STASH_OUT</code> tagged <code>MAIN</code>. Each row then covers only one side of the move. That breaks two things (see <em>Test scenarios → recon / stats</em>):</p>
+      <h3>1 · What the codebase changed</h3>
+      <table>
+        <thead><tr><th>Draft 1 assumed</th><th>The code says</th></tr></thead>
+        <tbody>
+          <tr><td>One portfolio document holds all balances</td><td>Two stores: the Mongo portfolio holds 8 balance types; the RethinkDB user row holds BTC, ETH, LTC and cash</td></tr>
+          <tr><td>Per-currency amounts, <code>Decimal128</code></td><td>Every balance is a USD amount stored as a float <code>Number</code>; the ledger does no rounding</td></tr>
+          <tr><td>New indexes on <code>transactions</code>, including a unique idempotency key</td><td>The collection is index-frozen; the migration job throws on any index change</td></tr>
+          <tr><td>The ledger row is the permanent audit record</td><td>Rows expire after 180 days</td></tr>
+          <tr><td>Balance and rows commit in one Mongo session</td><td>No runtime code uses a session; rows are written after the balance and a failed write is swallowed</td></tr>
+          <tr><td>A new bucket field and a back-fill</td><td><code>balanceType</code> is already the bucket (<code>usdt</code>, <code>usdtBonus</code>); nothing to back-fill</td></tr>
+          <tr><td>The bonus check is user-wide and must be narrowed</td><td>It is already <code>checkIfBonusActive(user, balanceType)</code></td></tr>
+          <tr><td>2FA codes can be replayed</td><td>Codes are already single-use for 120 s. Missing: any limit on wrong codes</td></tr>
+        </tbody>
+      </table>
+      <p><strong>New risk: totals.</strong> Cashback and lossback P&amp;L is <code>deposits − withdrawals − totalBalance</code>, and <code>totalBalance</code> sums the keys of <code>UserBalances</code>. If Stash is not a key of that object, stashed funds count as losses.</p>
+
+      <h3>2 · Decision: where the Stash balance lives</h3>
+      <div className="callout">
+        One new amount beside each existing balance, in whichever store holds that balance. This is exactly how the bonus
+        balance is stored today. Stash is <strong>not</strong> a new <code>BalanceType</code>.
+      </div>
+      <pre>{STORAGE}</pre>
       <ul>
-        <li>Summing transactions per bucket no longer equals the portfolio, so reconciliation needs special-case logic per type.</li>
-        <li><code>writeStatsForTransaction</code> filters out <code>STASH</code> rows, so the Main debit of a <code>STASH_IN</code> is never counted and the Main-balance snapshot drifts upward.</li>
+        <li><strong>Why beside the balance:</strong> both amounts of a transfer sit in one document in both stores, so the move is one atomic update, as the existing bonus-to-primary move is.</li>
+        <li><strong>Why not a <code>BalanceType</code>:</strong> selector lists, GraphQL enums and Mongoose validators are generated from <code>BalanceTypes</code>. A new entry would make Stash selectable and wagerable.</li>
+        <li><strong>No data migration:</strong> a missing field reads as 0, and the portfolio document is already created lazily.</li>
+        <li><strong>Cost:</strong> four more fields on a RethinkDB type headed "Do not add fields to this type". The bonus feature did the same. The lead needs to accept this, or pick an alternative.</li>
+        <li><strong>Alternatives:</strong> launch with the 8 portfolio types only; or keep all Stash in Mongo and accept a non-atomic, compensated transfer for the four legacy types.</li>
       </ul>
-      <p>With paired legs, <code>balanceType</code> alone is enough for the exclusion filter, reconciliation is a <code>$group</code>, and the rows map directly onto double-entry postings later.</p>
+
+      <h3>3 · How a transfer runs</h3>
       <pre>{TRANSFER_QUERY}</pre>
-
-      <h3>3 · ACP surface</h3>
       <ul>
-        <li><strong>Per-balance view:</strong> one row per currency showing Main (real / bonus), Stash, and whether a locked bonus is active. Read from the single portfolio doc.</li>
-        <li><strong>Transfer controls:</strong> <code>POST /admin/stash/{'{add|confiscate|reset}'}</code>. Confiscate uses the same <code>$gte</code> filter, and reset stores <code>previousTotal</code> in meta.</li>
-        <li><strong>Reason dropdown:</strong> a server-side enum, rejected if the value isn't on the list (the simulator rejects free text). Take <code>adminId</code> from the ACP session, never from the request body.</li>
-        <li><strong>Automatic audit log:</strong> this is just a query, <code>type ∈ ADMIN_STASH_* ∪ STASH_*</code>. No separate audit collection, because the ledger row is the audit record.</li>
-        <li>Add a new permission, <code>stash:adjust</code>. Four-eyes approval for large confiscations is deferred as a follow-up.</li>
+        <li><strong>Transfer in:</strong> flag and allow-list → explicit <code>balanceType</code> → amount check → per-user mutex → match-promo and bonus guards → guarded update → two rows.</li>
+        <li><strong>Transfer out:</strong> the same, with <code>check2faIfEnabled</code> in place of the bonus guards. It runs after the cheap checks, because a verified code is consumed for 120 s.</li>
+        <li><strong>Rows are not atomic with the balance.</strong> This is how the whole ledger works. The plan keeps it and adds an alert, rather than introducing sessions for one feature.</li>
+        <li><strong>Duplicate requests:</strong> a per-user Redis mutex, as on withdrawals. It stops a double-click, not a late retry. That is acceptable for a move between a player's own two amounts. A <code>requestId</code> lookup on the existing index is available if retries become a problem.</li>
       </ul>
 
-      <h3>4 · Integration points</h3>
+      <h3>4 · Data model appended to <code>transactions</code></h3>
+      <pre>{TX_DOCS}</pre>
+      <ul>
+        <li><strong>Two rows per transfer</strong> is the existing convention: <code>currentBalance</code> and <code>balanceType</code> describe one bucket, so one row cannot cover both sides.</li>
+        <li><strong>Deploy order:</strong> a schema hook throws when a stored <code>balanceType</code> is unknown. The validator must accept <code>&lt;BalanceType&gt;Stash</code> before the first row is written, or the admin transactions table and CSV export break for that user.</li>
+        <li><strong>A new type costs four compile-time places</strong> (<code>TransactionType</code>, <code>TransactionMeta</code>, <code>TransactionContext</code>, the stats map) plus the web client's history label map.</li>
+      </ul>
+
+      <h3>5 · Reading balances and integration points</h3>
       <table>
         <thead><tr><th>Where</th><th>Call</th><th>Rule</th></tr></thead>
         <tbody>
-          <tr><td>transferToStash</td><td className="mono">BonusService.checkIfBonusActive(userId, currency)</td><td><strong>Scope it by currency.</strong> The spec passes only <code>userId</code>, so an ETH bonus would block USDT stashing. The PRD says "on that balance". Transfer-in only.</td></tr>
-          <tr><td>transferFromStash</td><td className="mono">check2faIfEnabled(user, token)</td><td>If 2FA is enabled, the token must be valid and single-use (store the last accepted TOTP window). If 2FA is off, allow the transfer and return <code>warning</code>. Rate-limit failed attempts.</td></tr>
-          <tr><td>Auto-reload settings</td><td className="mono">check2faIfEnabled on enable / raise</td><td><strong>New requirement.</strong> Auto-reload skips 2FA later, so the consent has to be 2FA-gated when it's given.</td></tr>
-          <tr><td>Auto-reload trigger</td><td className="mono">checkAndTriggerAutoReload</td><td><strong>Trigger on bets only, never on withdrawals.</strong> Otherwise a stolen session can loop withdraw → reload → withdraw and drain Stash with no 2FA (scenario <em>drain</em>).</td></tr>
-          <tr><td>Balance selector / wager</td><td className="mono">mapBalanceInformation, getUserPortfolioBalances</td><td>Keep the guard clause: destructure <code>balances</code> only. Add a lint rule or test against <code>Object.values(portfolio)</code>.</td></tr>
-          <tr><td>Stats / websocket</td><td className="mono">writeStatsForTransaction</td><td>Exclude <code>balanceType: STASH</code>. This is only correct with paired legs (§2).</td></tr>
+          <tr><td>Selector, wagering</td><td className="mono">getBalanceFromUserAndType</td><td>Nothing to change. Bets and provider wallets read <code>balance + bonusBalance</code> of one balance type by name. Add a test that pins it.</td></tr>
+          <tr><td>Balance payload, totals</td><td className="mono">mapBalanceInformation</td><td>Add <code>&lt;type&gt;Stash</code> keys to <code>UserBalances</code> behind the flag, so that P&amp;L, reports and the ACP lookup count Stash. Filter them out of the public Connect API.</td></tr>
+          <tr><td>Transfer in</td><td className="mono">checkIfBonusActive(user, balanceType)</td><td>Already scoped to the balance type. Not a pure read (it can expire the bonus), and it fails open on a cache error, as it does for tips.</td></tr>
+          <tr><td>Transfer out</td><td className="mono">check2faIfEnabled(user, token)</td><td>Call it inline, not through the REST middleware. Add a per-user limit on wrong codes: none exists today on any route.</td></tr>
+          <tr><td>Every row</td><td className="mono">createTransaction</td><td>Emits <code>transactionCreated</code>, writes stats (no-op for the new types) and publishes the row's balance to FastTrack as <code>real_money</code>. Skip the FastTrack publish for Stash rows.</td></tr>
+          <tr><td>Account cleanup</td><td className="mono">cleanupOldUsers</td><td>Checks BTC, ETH and LTC primary balances only. Add the Stash fields.</td></tr>
+          <tr><td>Liability reporting</td><td className="mono">BigQuery views</td><td>Fixed column lists, defined outside the backend. Stash would drop out of player liabilities. Raise with Data Engineering.</td></tr>
         </tbody>
       </table>
 
-      <h3>5 · Open questions from the PRD</h3>
+      <h3>6 · ACP</h3>
+      <ul>
+        <li><strong>Per-balance view:</strong> the admin user lookup already returns <code>UserBalances</code>, so the new keys appear there.</li>
+        <li><strong>Transfer controls:</strong> admin GraphQL mutations <code>stashTransferIn</code> / <code>stashTransferOut</code>. Same move and rows as a player transfer, with <code>meta.source: "admin"</code>. Transfer in honours the bonus block; transfer out skips the player's 2FA.</li>
+        <li><strong>Permissions:</strong> a new action under the existing <code>balances</code> resource. Roles holding <code>balances:*</code> get it automatically.</li>
+        <li><strong>Reason dropdown:</strong> no balance action has a server-side reason list today; reasons are free text. For Stash, define the list as a GraphQL enum.</li>
+        <li><strong>Automatic audit log:</strong> wrap each admin transfer in <code>createAuditRecord</code> (the existing <code>audits</code> collection). The transaction row alone expires after 180 days.</li>
+        <li><strong>Not in phase 1:</strong> add, confiscate or reset directly on Stash. An admin can transfer out and use the existing controls.</li>
+      </ul>
+
+      <h3>7 · Open questions and decisions needed</h3>
       <table>
         <thead><tr><th>Question</th><th>Recommendation</th><th>Reason</th></tr></thead>
         <tbody>
-          <tr><td>Fiat support</td><td><strong>Defer.</strong> Ship for crypto only, behind a <code>stashEnabledCurrencies</code> allow-list.</td><td>Fiat balances carry payment-provider and safeguarding obligations that need Compliance sign-off. The schema is already currency-generic, so turning fiat on later is a config change, not a migration.</td></tr>
-          <tr><td>Optional 2FA on transfer-out</td><td><strong>Keep optional</strong> (enforced if enabled, otherwise a warning). Revisit once adoption data is in.</td><td>Making it mandatory would lock out every player without 2FA from their own funds on day one. The real bypass risk is auto-reload, which §4 closes regardless of this policy.</td></tr>
-          <tr><td><em>New:</em> auto-reload in phase 1?</td><td><strong>Ship behind a flag in a later phase.</strong></td><td>It works against the stated purpose of isolating funds from automated systems, and it's the only path that moves Stash funds without 2FA.</td></tr>
-          <tr><td><em>New:</em> auto-reload settings scope</td><td>Make settings per currency.</td><td>A single threshold can't mean the same thing for USDT and BTC.</td></tr>
+          <tr><td>Fiat support</td><td><strong>Defer.</strong> "Fiat" here is the <code>cash</code> balance type.</td><td>Technically it is the same as BTC, ETH and LTC, so enabling it later is one allow-list entry. Cash withdrawals have no 2FA step and carry KYC level 2 rules; Compliance should confirm first.</td></tr>
+          <tr><td>Optional 2FA on transfer out</td><td><strong>Keep optional</strong> (required when the player has 2FA).</td><td>Crypto withdrawals work this way today and they leave the platform. A stricter rule for a move to the primary balance would be inconsistent.</td></tr>
+          <tr><td>Auto-reload in phase 1</td><td><strong>No.</strong> Manual reload first.</td><td>Auto-reload belongs in the bet path, which is where the bonus balance cost most. Manual reload needs only stored settings and a client prompt.</td></tr>
+          <tr><td><em>Q1</em> Storage for BTC, ETH, LTC, cash</td><td>Four fields on the user row.</td><td>Keeps the move atomic. Alternatives in section 2.</td></tr>
+          <tr><td><em>Q2</em> Connect API shows Stash?</td><td>No.</td><td>It publishes every numeric balance key under its raw name.</td></tr>
+          <tr><td><em>Q3</em> Match-promo guard on transfer in?</td><td>Yes.</td><td>Tips, raffles and withdrawals apply it just before the bonus check.</td></tr>
+          <tr><td><em>Q4</em> Direct admin add / confiscate / reset on Stash?</td><td>Not in phase 1.</td><td>The ticket lists transfer controls only. "Reset all balances" does not reach bonus balances today either.</td></tr>
+          <tr><td><em>Q5</em> Audit retention</td><td><code>audits</code> record plus 180-day rows.</td><td>For the lead and PM to confirm.</td></tr>
+          <tr><td><em>Q6</em> CRM <code>real_money</code></td><td>Primary only.</td><td>For the CRM owner.</td></tr>
+          <tr><td><em>Q7</em> Owner of the wrong-code limit</td><td>Auth, for all TOTP routes.</td><td>Minimum: a limiter on the Stash mutation.</td></tr>
         </tbody>
       </table>
 
-      <h3>6 · What the simulation found in the spec</h3>
-      <ol>
-        <li>A locked-bonus check scoped to the user over-blocks other currencies, which contradicts the PRD.</li>
-        <li>Single-row transfer records break per-bucket reconciliation and skew the Main stats snapshot.</li>
-        <li>Auto-reload plus withdrawal lets a stolen session drain Stash without 2FA.</li>
-        <li>The overdraft check must sit in the Mongo filter. A read-then-write check lets a double-submit overdraw Main (the Naive preset shows this).</li>
-        <li>Unspecified: a <code>Decimal128</code> money type, idempotency keys, per-currency auto-reload settings, and single-use TOTP.</li>
-      </ol>
+      <h3>8 · Complexity compared with Bonus Balance</h3>
+      <ul>
+        <li><strong>Bonus Balance:</strong> 112 to 129 commits over 14 months, 355 files, five reverts. Most of it was the bet path: stake split, winnings split and about 49 game-provider files.</li>
+        <li><strong>Stash reuses the cheap part:</strong> a sibling amount in both stores, a <code>balanceType</code> suffix, extra balance keys, a flag, RBAC, admin mutations, locales.</li>
+        <li><strong>Stash avoids the expensive part:</strong> nothing in the bet path, and no lifecycle (status, expiry, wager progress, cache).</li>
+        <li><strong>New:</strong> a player-initiated move of an arbitrary amount, a 2FA step on a balance operation, a server-side reason list and an audit record.</li>
+      </ul>
 
-      <h3>7 · Follow-up stories for RD-25</h3>
+      <h3>9 · How the simulator maps to this plan</h3>
+      <ul>
+        <li><strong>Recommended</strong> is this plan. <strong>Spec as written</strong> is the Sept 2026 write-up taken literally and run against how the backend really works. <strong>Naive</strong> removes the safeguards.</li>
+        <li>The model has two stores (USDT and SOL in the Mongo portfolio, BTC and cash on the RethinkDB user row), USD amounts, single-document guarded updates, rows written after the balance, a 180-day TTL on rows, and the per-row socket event and FastTrack message.</li>
+        <li>Recommended passes 24 of 25 scenarios. The one it fails, a late retry of a finished request, is the accepted gap from section 3 and is shown as GAP.</li>
+        <li>Not modelled: the feature flag, the match-promo guard, the user note and Slack log, the BigQuery liability views, and the client.</li>
+      </ul>
+
+      <h3>10 · Follow-up stories for RD-25</h3>
       <table>
         <thead><tr><th>#</th><th>Story</th><th style={{ textAlign: 'right' }}>Pts</th></tr></thead>
         <tbody>
-          {[
-            ['Portfolio schema: stashBalances sub-doc, default migration, Decimal128', 2],
-            ['Transaction schema: balanceType, currency, stash types, transferId/leg, idempotencyKey, indexes, back-fill MAIN', 3],
-            ['Bucket-aware buildIncrementBalanceQuery + guard clause in balance retrieval (+ isolation test)', 3],
-            ['transferToStash: per-currency bonus check, single atomic update, paired legs', 3],
-            ['transferFromStash: 2FA single-use token, warning path, rate limit', 3],
-            ['Stats + websocket payload enrichment, STASH exclusion', 2],
-            ['ACP: per-balance view, add/confiscate/reset endpoints, reason enum, stash:adjust permission, audit view', 5],
-            ['Reconciliation job: Σ legs per bucket = portfolio, alert on drift', 3],
-            ['Player UI: Stash vault, transfer modals, 2FA prompt + warning', 5],
-            ['(flagged, later phase) Auto-reload: per-currency settings, 2FA on enable, bets-only trigger', 5],
-          ].map(([s, p], i) => (
+          {STORIES.map(([s, p], i) => (
             <tr key={i}><td className="faint">{i + 1}</td><td>{s}</td><td className="num">{p}</td></tr>
           ))}
-          <tr><td /><td><strong>Total</strong> (29 pts before auto-reload)</td><td className="num"><strong>34</strong></td></tr>
+          <tr><td /><td><strong>Phase 1, stories 1–10</strong> (36 with manual reload; estimates unvalidated)</td><td className="num"><strong>33</strong></td></tr>
         </tbody>
       </table>
     </div>

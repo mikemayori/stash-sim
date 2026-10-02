@@ -146,6 +146,7 @@ tr.new td { animation: flash 1.2s ease-out; }
 .pill { display: inline-block; min-width: 46px; text-align: center; font-weight: 700; font-size: 11px; padding: 3px 8px; border-radius: 4px; }
 .pill.pass { background: color-mix(in srgb, var(--ok) 16%, transparent); color: var(--ok); }
 .pill.fail { background: color-mix(in srgb, var(--err) 16%, transparent); color: var(--err); }
+.pill.gap { background: color-mix(in srgb, var(--warn) 16%, transparent); color: var(--warn); }
 
 /* plan */
 .plan { max-width: 980px; }
