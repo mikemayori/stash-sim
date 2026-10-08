@@ -194,6 +194,34 @@ function loc(s, bt, bucket) {
 }
 export const readBalance = (s, bt, bucket = 'primary') => loc(s, bt, bucket).get();
 export const stashPath = (s, bt) => loc(s, bt, 'stash').path;
+/** Database and path of one amount, for display. */
+export const pathOf = (s, bt, bucket) => {
+  const { db, path } = loc(s, bt, bucket);
+  return { db, path };
+};
+
+/** The documents as they would be stored under the current storage model (for the Database tab). */
+export function storedDocuments(s) {
+  const sibling = s.config.storage === 'sibling';
+  const { stashBalances, balances, ...portfolio } = s.portfolio;
+  const { btcStashBalance, cashStashBalance, deleted, ...user } = s.user; // eslint-disable-line no-unused-vars
+  return {
+    portfolio: {
+      ...portfolio,
+      balances: Object.fromEntries(Object.entries(balances).map(([bt, { stashBalance, ...rest }]) => [bt, sibling ? { ...rest, stashBalance } : rest])),
+      ...(sibling ? {} : { stashBalances }),
+    },
+    user: sibling ? { ...user, btcStashBalance, cashStashBalance } : user,
+    transactions: s.transactions.slice(0, 4),
+    audits: s.audits.slice(0, 2),
+    settings: { userId: s.user.id, stashReload: s.settings.stashReload },
+    redis: {
+      'namedLock:<user>:stash:transfer': s.config.duplicates === 'none' ? '(not used)' : 'held only while a transfer runs',
+      'totp-used:<hmac(user, code)>': `${Object.values(s.redis.totpUsed).filter((t) => t > s.clock).length} live keys, EX 120`,
+      '2fa-attempts:<user>': s.config.wrongCodeLimit === 'limiter' ? `${s.clock < s.redis.twoFaFails.resetAt ? s.redis.twoFaFails.count : 0} of ${WRONG_CODE_LIMIT}, 5 min window` : '(not used)',
+    },
+  };
+}
 const updateName = (db) => (db === 'Mongo' ? 'findOneAndUpdate (pipeline)' : 'users.get(id).update()');
 
 /** One unconditional update of one document. `changes` is a list of [balanceType, bucket, delta]. */
@@ -232,27 +260,60 @@ function maybeCrash(s) {
   }
 }
 
+/** The three amounts of one balance type, as the `original*` scratch fields capture them before an update. */
+const snapshot = (s, bt) => ({ balance: readBalance(s, bt), bonusBalance: readBalance(s, bt, 'bonus'), stashBalance: readBalance(s, bt, 'stash') });
+
 /**
- * Move `amount` between primary and Stash of one balance type.
+ * The DAL's return for a transfer: the backend's `UserPortfolioBalanceUpdateResult`
+ * (resultant / previous / change for primary and bonus) extended with the same three
+ * fields for Stash. As in the backend, the *AmountChange values are unsigned
+ * magnitudes; the caller applies the sign from the direction.
+ */
+function transferResult(before, s, bt) {
+  const after = snapshot(s, bt);
+  return {
+    resultantBalance: after.balance,
+    resultantBonusBalance: after.bonusBalance,
+    resultantStashBalance: after.stashBalance,
+    previousBalance: before.balance,
+    previousBonusBalance: before.bonusBalance,
+    previousStashBalance: before.stashBalance,
+    primaryAmountChange: Math.abs(r8(after.balance - before.balance)),
+    bonusAmountChange: Math.abs(r8(after.bonusBalance - before.bonusBalance)),
+    stashAmountChange: Math.abs(r8(after.stashBalance - before.stashBalance)),
+  };
+}
+
+/**
+ * Move `amount` between primary and Stash of one balance type. Returns the transfer
+ * result, or false when nothing moved.
  * When both amounts are in one document and the guard is in the update, this is
- * one atomic write. Otherwise it is a debit followed by a credit, with nothing
- * to roll the debit back if the process stops in between.
+ * one atomic write that always succeeds; a refused move leaves the amounts as they
+ * were, and the caller detects the no-op from previous = resultant (the backend's
+ * existing pattern). Otherwise it is a debit followed by a credit, with nothing to
+ * roll the debit back if the process stops in between.
  */
 function moveFunds(s, bt, amount, dir, from = 'Ledger') {
   const src = loc(s, bt, dir === 'in' ? 'primary' : 'stash');
   const dst = loc(s, bt, dir === 'in' ? 'stash' : 'primary');
   const oneDoc = src.db === dst.db;
+  const before = snapshot(s, bt);
 
   if (oneDoc && s.config.overdraft === 'atomic') {
-    step(s, from, src.db, updateName(src.db), 'call', { guard: `${src.path} >= ${amount}`, [src.path]: -amount, [dst.path]: amount });
-    if (src.get() < amount) {
-      step(s, src.db, from, 'no-op: the guard did not hold', 'return');
+    step(s, from, src.db, updateName(src.db), 'call', { guard: `${src.path} >= ${amount}`, [src.path]: -amount, [dst.path]: amount, keeps: 'original* scratch fields' });
+    const canMove = src.get() >= amount; // evaluated inside the update
+    if (canMove) {
+      src.set(r8(src.get() - amount));
+      dst.set(r8(dst.get() + amount));
+    }
+    const result = transferResult(before, s, bt);
+    step(s, src.db, from, canMove ? 'updated document (new: true)' : 'updated document, amounts unchanged', 'return', result);
+    if (result.primaryAmountChange === 0 && result.stashAmountChange === 0) {
+      s.lastOp.result = result;
+      note(s, from, 'previous = resultant → no-op → not enough balance');
       return false;
     }
-    src.set(r8(src.get() - amount));
-    dst.set(r8(dst.get() + amount));
-    step(s, src.db, from, 'both amounts changed in one document', 'return');
-    return true;
+    return result;
   }
 
   if (!oneDoc) note(s, from, `${src.db} + ${dst.db}: no transaction can span them`);
@@ -260,7 +321,9 @@ function moveFunds(s, bt, amount, dir, from = 'Ledger') {
   maybeCrash(s);
   step(s, from, dst.db, updateName(dst.db), 'call', { [dst.path]: amount });
   dst.set(r8(dst.get() + amount));
-  return true;
+  const result = transferResult(before, s, bt);
+  note(s, from, 'result assembled from two separate writes', result);
+  return result;
 }
 
 /* ─── transactions and their side effects ─── */
@@ -285,9 +348,15 @@ function createTransaction(s, doc, from = 'Ledger') {
   return tx;
 }
 
-/** Rows for one transfer. They are written after the balance moved; a failure is swallowed, as in the ledger. */
-function recordTransfer(s, kind, bt, amount, meta) {
+/**
+ * Rows for one transfer, built only from the DAL's transfer result: amounts are the
+ * unsigned changes signed by direction, and `currentBalance` is the resultant amount.
+ * They are written after the balance moved; a failure is swallowed, as in the ledger.
+ */
+function recordTransfer(s, kind, bt, result, meta) {
   const dirIn = kind === 'stashIn';
+  const amount = result.stashAmountChange;
+  s.lastOp.result = result;
   try {
     if (s.fault === 'rowWrite') {
       s.fault = 'none';
@@ -296,13 +365,13 @@ function recordTransfer(s, kind, bt, amount, meta) {
     }
     if (s.config.rowModel === 'spec') {
       // Spec: one row; STASH_IN is tagged STASH, STASH_OUT is tagged MAIN.
-      createTransaction(s, { type: dirIn ? 'STASH_IN' : 'STASH_OUT', currency: bt, balanceType: dirIn ? 'STASH' : 'MAIN', amount, currentBalance: readBalance(s, bt, dirIn ? 'stash' : 'primary'), meta });
+      createTransaction(s, { type: dirIn ? 'STASH_IN' : 'STASH_OUT', currency: bt, balanceType: dirIn ? 'STASH' : 'MAIN', amount, currentBalance: dirIn ? result.resultantStashBalance : result.resultantBalance, meta });
       return;
     }
     // Stash row first, so the last socket event and CRM message carry the primary balance.
     const m = { transferId: oid(s), ...meta };
-    createTransaction(s, { type: kind, balanceType: `${bt}Stash`, amount: dirIn ? amount : -amount, currentBalance: readBalance(s, bt, 'stash'), meta: m });
-    createTransaction(s, { type: kind, balanceType: bt, amount: dirIn ? -amount : amount, currentBalance: readBalance(s, bt), meta: m });
+    createTransaction(s, { type: kind, balanceType: `${bt}Stash`, amount: dirIn ? result.stashAmountChange : -result.stashAmountChange, currentBalance: result.resultantStashBalance, meta: m });
+    createTransaction(s, { type: kind, balanceType: bt, amount: dirIn ? -result.primaryAmountChange : result.primaryAmountChange, currentBalance: result.resultantBalance, meta: m });
   } catch (e) {
     if (!(e instanceof RowWriteError)) throw e;
     step(s, 'Mongo', 'Ledger', '💥 insert failed', 'error');
@@ -512,8 +581,10 @@ const transferMeta = (s, source, requestId, extra = {}) => ({ source, ...(s.conf
 
 /** Move the funds, then write the rows. Returns true, false (insufficient funds) or 'crash'. */
 function runMove(s, bt, amount, dir, meta, from = 'Ledger') {
+  let result;
   try {
-    if (!moveFunds(s, bt, amount, dir, from)) return false;
+    result = moveFunds(s, bt, amount, dir, from);
+    if (!result) return false;
   } catch (e) {
     if (!(e instanceof Crash)) throw e;
     note(s, from, `💥 ${e.message}`);
@@ -525,7 +596,7 @@ function runMove(s, bt, amount, dir, meta, from = 'Ledger') {
     s.fault = 'none';
     note(s, from, 'one update: there is no point between debit and credit to crash at');
   }
-  recordTransfer(s, dir === 'in' ? 'stashIn' : 'stashOut', bt, amount, meta);
+  recordTransfer(s, dir === 'in' ? 'stashIn' : 'stashOut', bt, result, meta);
   return true;
 }
 
@@ -583,9 +654,10 @@ export function raceTransferToStash(state, { balanceType: bt, amount, requestId 
   if (seen < amount) return fail(s, 'Both rejected: not enough primary balance');
   note(s, 'Ledger', `A & B: ${seen} ≥ ${amount} ✓ (stale check)`);
   for (let i = 0; i < 2; i++) {
+    const before = snapshot(s, bt);
     applyUpdate(s, [[bt, 'primary', -amount]]);
     applyUpdate(s, [[bt, 'stash', amount]]);
-    recordTransfer(s, 'stashIn', bt, amount, meta);
+    recordTransfer(s, 'stashIn', bt, transferResult(before, s, bt), meta);
   }
   if (src.get() < 0) note(s, src.db, '⚠ the primary balance is now negative');
   return succeed(s, '2/2 requests applied');

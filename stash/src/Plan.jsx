@@ -53,7 +53,7 @@ meta: { transferId: "<uuid>",                    // links the two rows; not inde
 
 const STORIES = [
   ['Ledger readers: <BalanceType>Stash in the balance-type validator; stashIn / stashOut in the four compile-time places, no-op stats. Deployed one release ahead of any writer', 2],
-  ['Storage and atomic move: stashBalance in the portfolio schema, four user-row fields, guarded transfer in both DALs, two rows, alert on failed row write, Mongo integration test', 5],
+  ['Storage and atomic move: stashBalance in the portfolio schema, four user-row fields, guarded transfer in both DALs returning StashTransferResult, two rows built from it, alert on failed row write, Mongo integration test', 5],
   ['Read model: <type>Stash keys in UserBalances behind the flag, GraphQL fields, Connect API filter, account-cleanup filter, test that wagering excludes Stash', 3],
   ['Player transfer in: mutation, flag and allow-list, mutex, match-promo and bonus guards, error keys and locales', 3],
   ['Player transfer out: mutation, check2faIfEnabled, wrong-code limiter', 3],
@@ -110,6 +110,7 @@ export default function Plan() {
       <ul>
         <li><strong>Transfer in:</strong> flag and allow-list → explicit <code>balanceType</code> → amount check → per-user mutex → match-promo and bonus guards → guarded update → two rows.</li>
         <li><strong>Transfer out:</strong> the same, with <code>check2faIfEnabled</code> in place of the bonus guards. It runs after the cheap checks, because a verified code is consumed for 120 s.</li>
+        <li><strong>The DAL returns the result:</strong> the backend's <code>UserPortfolioBalanceUpdateResult</code> (resultant / previous / change for primary and bonus) extended with <code>resultantStashBalance</code>, <code>previousStashBalance</code> and <code>stashAmountChange</code>, as a new <code>StashTransferResult</code>. Changes are unsigned, previous values come from the <code>original*</code> scratch fields, a refused move is detected by previous = resultant, and both rows are built only from this result.</li>
         <li><strong>Rows are not atomic with the balance.</strong> This is how the whole ledger works. The plan keeps it and adds an alert, rather than introducing sessions for one feature.</li>
         <li><strong>Duplicate requests:</strong> a per-user Redis mutex, as on withdrawals. It stops a double-click, not a late retry. That is acceptable for a move between a player's own two amounts. A <code>requestId</code> lookup on the existing index is available if retries become a problem.</li>
       </ul>
@@ -175,7 +176,7 @@ export default function Plan() {
       <ul>
         <li><strong>Recommended</strong> is this plan. <strong>Spec as written</strong> is the Sept 2026 write-up taken literally and run against how the backend really works. <strong>Naive</strong> removes the safeguards.</li>
         <li>The model has two stores (USDT and SOL in the Mongo portfolio, BTC and cash on the RethinkDB user row), USD amounts, single-document guarded updates, rows written after the balance, a 180-day TTL on rows, and the per-row socket event and FastTrack message.</li>
-        <li>Recommended passes 24 of 25 scenarios. The one it fails, a late retry of a finished request, is the accepted gap from section 3 and is shown as GAP.</li>
+        <li>Recommended passes 25 of 26 scenarios. The one it fails, a late retry of a finished request, is the accepted gap from section 3 and is shown as GAP.</li>
         <li>Not modelled: the feature flag, the match-promo guard, the user note and Slack log, the BigQuery liability views, and the client.</li>
       </ul>
 

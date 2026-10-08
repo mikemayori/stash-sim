@@ -8,6 +8,7 @@ import {
 } from './engine.js';
 import { SCENARIOS, runScenario } from './scenarios.js';
 import Plan from './Plan.jsx';
+import Database from './Database.jsx';
 
 // Every amount is USD, whatever the balance type.
 const fmt = (n) => Number(n).toFixed(2);
@@ -31,10 +32,13 @@ const seeded = (config) => [
 ].reduce((s, [fn, args]) => fn(s, args), createState(config));
 
 export default function App() {
-  // `#scenarios` / `#plan` open that tab directly (used for headless screenshots).
-  const [tab, setTab] = useState(() => (['scenarios', 'plan'].includes(window.location.hash.slice(1)) ? window.location.hash.slice(1) : 'sim'));
-  const [state, setState] = useState(() => seeded(PRESETS.spec.config));
-  const [preset, setPreset] = useState('spec');
+  // `#db` / `#scenarios` / `#plan` open that tab directly; `?preset=recommended` picks the starting preset.
+  const [tab, setTab] = useState(() => (['db', 'scenarios', 'plan'].includes(window.location.hash.slice(1)) ? window.location.hash.slice(1) : 'sim'));
+  const [preset, setPreset] = useState(() => {
+    const p = new URLSearchParams(window.location.search).get('preset');
+    return PRESETS[p] ? p : 'spec';
+  });
+  const [state, setState] = useState(() => seeded(PRESETS[preset].config));
 
   // Sim clock drives the TOTP window; one real second = one sim second.
   useEffect(() => {
@@ -59,7 +63,7 @@ export default function App() {
       <div className="topbar">
         <h1>Stash Balance <span>Simulator</span></h1>
         <div className="tabs">
-          {[['sim', 'Simulator'], ['scenarios', 'Test scenarios'], ['plan', 'Technical plan']].map(([k, l]) => (
+          {[['sim', 'Simulator'], ['db', 'Database'], ['scenarios', 'Test scenarios'], ['plan', 'Technical plan']].map(([k, l]) => (
             <button key={k} className={tab === k ? 'on' : ''} onClick={() => setTab(k)}>{l}</button>
           ))}
         </div>
@@ -68,6 +72,7 @@ export default function App() {
       </div>
 
       {tab === 'sim' && <Simulator state={state} run={run} setState={setState} preset={preset} applyPreset={applyPreset} reset={reset} />}
+      {tab === 'db' && <Database state={state} preset={preset} />}
       {tab === 'scenarios' && <Scenarios load={loadScenario} />}
       {tab === 'plan' && <Plan />}
     </div>

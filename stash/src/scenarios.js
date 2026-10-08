@@ -168,6 +168,41 @@ export const SCENARIOS = [
     },
   },
   {
+    id: 'update-result',
+    suite: 'new: DAL contract',
+    title: 'The transfer result (UserPortfolioBalanceUpdateResult + Stash fields) drives both rows, in Mongo and RethinkDB',
+    run(config) {
+      const notes = [];
+      let ok = true;
+      const expect = (label, cond) => { if (!cond) { ok = false; notes.push(`✗ ${label}`); } };
+      let s = createState(config);
+      for (const bt of ['usdt', 'crypto']) {
+        s = deposit(s, { balanceType: bt, amount: 100 });
+        // in: 60 of 100
+        s = transferToStash(s, { balanceType: bt, amount: 60 });
+        let r = s.lastOp.result;
+        let [primaryRow, stashRow] = s.transactions; // newest first: the primary row is written last
+        expect(`${bt} in: result`, r && r.previousBalance === 100 && r.resultantBalance === 40 && r.previousStashBalance === 0 && r.resultantStashBalance === 60 && r.primaryAmountChange === 60 && r.stashAmountChange === 60 && r.bonusAmountChange === 0);
+        expect(`${bt} in: Stash row = +stashAmountChange, currentBalance = resultantStashBalance`, stashRow?.balanceType === `${bt}Stash` && stashRow.amount === r?.stashAmountChange && stashRow.currentBalance === r?.resultantStashBalance);
+        expect(`${bt} in: primary row = −primaryAmountChange, currentBalance = resultantBalance`, primaryRow?.balanceType === bt && primaryRow.amount === -r?.primaryAmountChange && primaryRow.currentBalance === r?.resultantBalance);
+        // out: 20 of 60
+        s = tick(s, 30000);
+        s = transferFromStash(s, { balanceType: bt, amount: 20, token: totp(s.clock + 1000) });
+        r = s.lastOp.result;
+        [primaryRow, stashRow] = s.transactions;
+        expect(`${bt} out: changes are unsigned (20 / 20)`, r && r.primaryAmountChange === 20 && r.stashAmountChange === 20);
+        expect(`${bt} out: rows signed by direction (Stash −20, primary +20)`, stashRow?.amount === -20 && primaryRow?.amount === 20 && primaryRow.currentBalance === 60 && stashRow.currentBalance === 40);
+        // refused: 500 of 60 → the update runs but changes nothing
+        const rows = s.transactions.length;
+        s = transferToStash(s, { balanceType: bt, amount: 500 });
+        r = s.lastOp.result;
+        expect(`${bt} refused: no-op detected, no rows`, s.lastOp.ok === false && s.transactions.length === rows && (!r || (r.previousBalance === r.resultantBalance && r.previousStashBalance === r.resultantStashBalance)));
+        notes.push(`${bt}: primary ${readBalance(s, bt)}, stash ${stash(s, bt)}`);
+      }
+      return { state: s, pass: ok, notes: ok ? ['every row matches the transfer result, in both stores and both directions', ...notes] : notes };
+    },
+  },
+  {
     id: 'row-fail',
     suite: 'new: transactions',
     title: 'The row write fails after the balance moved: funds are intact and someone is told',

@@ -158,3 +158,10 @@ tr.new td { animation: flash 1.2s ease-out; }
 .plan table { margin: 8px 0 12px; }
 .plan strong { color: var(--text); }
 .callout { border-left: 3px solid var(--stash); background: var(--panel-2); padding: 10px 12px; border-radius: 6px; margin: 10px 0; }
+
+/* database tab */
+.db { display: flex; flex-direction: column; gap: 14px; }
+.dbgrid { display: grid; grid-template-columns: repeat(2, minmax(0, 1fr)); gap: 14px; align-items: start; }
+.db pre { background: var(--bg); border: 1px solid var(--line); border-radius: 8px; padding: 10px 12px; overflow-x: auto; font-family: var(--mono); font-size: 11.5px; line-height: 1.5; color: var(--muted); max-height: 420px; overflow-y: auto; }
+.db pre .hl { color: var(--stash); }
+@media (max-width: 1100px) { .dbgrid { grid-template-columns: 1fr; } }
