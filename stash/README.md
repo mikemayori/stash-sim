@@ -23,7 +23,11 @@ npm test        # headless scenario matrix (Naive / Spec / Recommended)
   stored, a 2FA authenticator, player actions, reload settings, the ACP (balances, totals and
   P&L, admin transfers, CSV export, account cleanup, +181 days, audit log), a sequence diagram
   of every operation (hover a step for the payload), `mongo0.transactions`, and invariant checks.
-- **Test scenarios**: 25 scenarios run against every preset. Click a cell, then
+- **Database**: the database design. What changes in each store, where each amount lives, and each
+  store's schema (new fields highlighted) next to the live documents from the simulator. Opens
+  directly with `#db`; add `?preset=recommended` to start on the Recommended design, for example
+  `http://localhost:3001/?preset=recommended#db`.
+- **Test scenarios**: 26 scenarios run against every preset. Click a cell, then
   **Load into simulator** to open that scenario's end state. `#scenarios` opens this tab directly.
 - **Technical plan**: a summary of `TECHNICAL_PLAN.md`. `#plan` opens this tab directly.
 
@@ -42,7 +46,7 @@ npm test        # headless scenario matrix (Naive / Spec / Recommended)
 ## Files
 - `src/engine.js`: the pure engine (stores, guarded updates, rows and their side effects, 2FA, reload, ACP, invariants)
 - `src/scenarios.js`: scenario definitions shared by the UI and `npm test`
-- `src/App.jsx`, `src/Plan.jsx`: the UI
+- `src/App.jsx`, `src/Database.jsx`, `src/Plan.jsx`: the UI
 - `TECHNICAL_PLAN.md`: the written plan and acceptance-criteria status
 - `STASH_CODEBASE_FINDINGS.md`: the backend investigation the plan is based on
 - `CODEBASE_PROMPT.md`: the prompt that produced it
