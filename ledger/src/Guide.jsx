@@ -1,89 +1,148 @@
-import { KNOBS, PRESETS } from './engine.js';
-import { SCENARIOS } from './scenarios.js';
+import { EVIDENCE, LABELS, PRESETS, TX_TTL_DAYS } from './engine.js';
+import { SCENARIOS, STASH_SCENARIOS, MIGRATION_SCENARIOS } from './scenarios.js';
+import { Chip, Ev, STATUS_CLASS } from './ui.jsx';
 
 const Box = ({ title, children }) => <div className="box"><b>{title}</b><span>{children}</span></div>;
 const Arrow = () => <div className="arrow">→</div>;
+
+const LABEL_MEANING = {
+  Code: 'Read in the backend source at the studied commit.',
+  Meeting: 'Said by the team in a walkthrough. Not checked in the source.',
+  Study: 'Stated in LEDGER_STUDY.md.',
+  Inferred: 'Follows from other facts. Nobody stated it.',
+  Open: 'Not known. The simulator has a knob for it.',
+  Assumed: 'A choice the simulator had to make to run. It may be wrong.',
+  Proposed: 'Does not exist in the backend. It is a suggested change.',
+};
+const STATUS_MEANING = [
+  ['PASS', 'The result is correct, and the documents say it should be.'],
+  ['DEBT', 'A documented error reproduces under the Current ledger (or Current + Stash).'],
+  ['OPEN', 'The result depends on an Open knob. The scenario runs once per option and each option gives its documented result.'],
+  ['N/F', 'The error still reproduces under Hardened. It cannot be fixed without something that is blocked.'],
+  ['fail', 'Pseudocode fails. That is the point of the preset.'],
+  ['MISMATCH', 'The result differs from what the documents imply. This is a bug in the simulator, and npm test fails.'],
+  ['RISK', 'Migration cases only: the documented migration risk reproduces.'],
+];
 
 export default function Guide() {
   return (
     <div className="panel guide">
       <h3>What this is</h3>
-      <p>A working model of the ledger described in <code>LEDGER_STUDY.md</code>. It runs entirely in the browser: there is no server and no database. The documents you see (<code>user_altcoin_portfolios</code>, <code>users</code>, <code>transactions</code>) are plain objects in memory, changed by the same steps the study describes.</p>
-      <p>Use it to answer two kinds of question: <strong>what does the ledger do when X happens</strong>, and <strong>what breaks, and what would fix it</strong>.</p>
+      <p>A model of the balance ledger as it works today. It runs in the browser. There is no server and no database: the stores are plain objects, changed by the same steps the backend uses.</p>
+      <p>It answers two questions. What does the ledger do when X happens? What goes wrong, and what would fix it?</p>
 
-      <h3>What happens when you click a button</h3>
+      <h3>The two stores and the routing</h3>
+      <p>A balance type lives in one of two stores. <Ev id="L-01" /></p>
+      <table>
+        <thead><tr><th>Store</th><th>Holds</th><th>Updated with</th></tr></thead>
+        <tbody>
+          <tr><td><strong>RethinkDB</strong> <code>users</code> row</td><td>crypto (BTC), eth, ltc, cash. Plain fields such as <code>balance</code> and <code>cashBonusBalance</code>.</td><td>ReQL, through the userObject service.</td></tr>
+          <tr><td><strong>Mongo</strong> <code>user_altcoin_portfolios</code></td><td>usdt, sol and six more. One document per user, created on first use.</td><td>An update pipeline, through the portfolio service.</td></tr>
+          <tr><td><strong>Mongo</strong> <code>transactions</code></td><td>One row per bucket changed, for every balance type in both stores.</td><td>A separate insert, after the balance update.</td></tr>
+        </tbody>
+      </table>
       <div className="flow">
-        <Box title="1. Button">An action such as Deposit, Bet or Refund, with the selected balance type and amount.</Box>
+        <Box title="1. Caller">Bet, Payments, Bonus, Sportsbook, ACP or a job calls the ledger.</Box>
         <Arrow />
-        <Box title="2. Engine operation">A function in <code>engine.js</code> takes the current state and returns a new one. It never changes the old state.</Box>
+        <Box title="2. lib/index.ts">The entry point. It routes by <code>balanceType</code> to one of two services.</Box>
         <Arrow />
-        <Box title="3. Trace">While it runs, the operation records every call, return, error and note as a step.</Box>
+        <Box title="3. One atomic update">The guard and the primary/bonus split run inside one update on one document or row.</Box>
         <Arrow />
-        <Box title="4. Screen">Balances, sequence diagram, transaction rows and rule checks are all redrawn from the new state.</Box>
+        <Box title="4. Row insert">A second write to <code>transactions</code>. Listeners run on each insert.</Box>
       </div>
-      <p>Inside step 2, a balance change follows the study exactly: the calling module calls the ledger API, the ledger routes to the right store, one update pipeline changes the balance, and the transaction rows are written afterwards in a separate write.</p>
-      <p>The update pipeline is real: the engine builds MongoDB-style stages (<code>$set</code>, <code>$cond</code>, <code>$min</code>…) and a small evaluator runs them against the document. The Database tab shows the pipeline of the last update.</p>
+      <p>Each balance type has a primary amount and a bonus amount. A deduction takes primary first, then bonus. If both together are not enough, nothing changes and the caller gets <code>bet__not_enough_balance</code>. Withdrawals and tips use primary only. The sportsbook passes <code>allowNegative</code>, which skips the guard.</p>
+      <p>A call with no <code>balanceType</code> is not rejected. It falls back to the user’s selected balance, and an empty identifier resolves to BTC. <Ev id="L-80" /></p>
 
-      <h3>The Simulator screen</h3>
-      <div className="screen">
-        <div className="wide"><b>Preset bar</b><span>Which version of the ledger is running, and the design knobs behind it.</span></div>
-        <div><b>Balances, Actions, Open bets</b><span>Click a balance row to choose what the buttons act on. Payments, bets and bonuses are here.</span></div>
-        <div><b>Sequence and Event log</b><span>The last operation, step by step, and a running history of results.</span></div>
-        <div><b>Concurrency &amp; faults, Admin, Responsible gaming</b><span>Simultaneous requests, replays, a failed row insert, time jumps, admin set, limits.</span></div>
-        <div className="two"><b>transactions</b><span>The history rows, newest first. Click a row for the whole document.</span></div>
-        <div><b>Invariants</b><span>Six rules checked after every action. A red ✗ means the ledger is now wrong.</span></div>
-      </div>
+      <h3>The Mongo pipeline and the stored scratch fields</h3>
+      <p>Mongo returns only the document after an update. The ledger needs the before values to know how much came from each bucket. So the first pipeline stage copies them into the document itself:</p>
+      <ol>
+        <li>Stage 1 writes <code>originalBalance</code> and <code>originalBonusBalance</code> from the current amounts.</li>
+        <li>The next stage computes the split from those values. On a shortfall it writes the old values back, which is a no-op.</li>
+        <li>After the update, <code>computeDebitAmountChanges</code> subtracts <code>original*</code> from the returned amounts. Zero change on a non-zero request means refused.</li>
+      </ol>
+      <p>The scratch fields are in the schema. They stay on every portfolio document and go stale. The Balances panel shows them dimmed. <Ev id="L-25" /></p>
+      <p>The simulator builds real pipeline stages and runs them with a small evaluator. The Database tab shows the filter and pipeline of the last update. The stage layout is reconstructed, not copied. <Ev id="A-layout" /></p>
+
+      <h3>The ReQL path</h3>
+      <p>The legacy types use one ReQL update: <code>r.branch(guard, change, {'{}'})</code> with <code>returnChanges: true</code>. RethinkDB returns both images of the row, so it needs no scratch fields. An empty change list means refused.</p>
+      <p>The split logic is written twice, once per store. The two differ slightly, not on purpose, and the exact difference is open. The simulator assumes they match. The knob “ReQL split vs Mongo” switches to one hypothesis so the difference can be seen. <Ev id="L-28" /></p>
+      <p>The RethinkDB path is not in the integration test harness. <Ev id="L-97" /></p>
+
+      <h3>The separate row write, and what happens when it fails</h3>
+      <p>The balance update and the row insert are two writes. No session ties them together. <Ev id="L-51" /></p>
+      <ul>
+        <li>If the insert fails, the error is logged and swallowed. The caller gets <code>transactionId: undefined</code>. The balance stays changed. <Ev id="L-52" /></li>
+        <li>No metric, alert or reconciliation job exists. <Ev id="L-53" /></li>
+        <li>The listeners hang off the insert, so the socket event, stats and FastTrack publish are skipped too. <Chip label="Inferred" /></li>
+        <li>Rows expire after {TX_TTL_DAYS} days, so balances cannot be rebuilt from rows.</li>
+      </ul>
+      <p>Use “Fail next insert” in Faults &amp; timing, run a bet, and watch the invariant “Latest row matches balance” turn red.</p>
+
+      <h3>Duplicate protection sits outside the ledger</h3>
+      <p>The ledger has no idempotency key. Each caller looks for a row it wrote before, then calls the ledger. <Ev id="L-55" /></p>
+      <ul>
+        <li>If the row insert failed, the retry finds no row and the change is applied twice.</li>
+        <li>If two deliveries arrive together, both look before either has written.</li>
+        <li>If the check reads a lagging secondary, the row may not be visible yet. Which node it reads is open.</li>
+        <li>After {TX_TTL_DAYS} days the row is gone.</li>
+      </ul>
+      <p>Refunds have the same weakness: they rebuild the primary/bonus split from the bet’s rows.</p>
+
+      <h3>The four presets</h3>
+      <table>
+        <thead><tr><th>Preset</th><th>What it is</th><th>Status</th></tr></thead>
+        <tbody>
+          {Object.entries(PRESETS).map(([k, p]) => (
+            <tr key={k}><td><strong>{p.label}</strong><div className="mono faint">?preset={k}</div></td><td>{p.blurb}</td><td>{k === 'hardened' || k === 'stash' ? <Chip label="Proposed" /> : k === 'current' ? <span className="tag muted">as documented</span> : <span className="tag muted">teaching aid</span>}</td></tr>
+          ))}
+        </tbody>
+      </table>
+      <p><strong>Hardened and Current + Stash are proposals.</strong> Nothing in them exists in the backend. Hardened uses only changes that fit the real constraints: no unique index, no sessions, no new fields on <code>transactions</code>. Stash adds a dedicated transfer path and leaves the existing paths alone.</p>
+      <p>“Show design knobs” lists every decision behind a preset. Change one and see which invariant or scenario moves.</p>
+
+      <h3>What the labels mean</h3>
+      <p>Every behaviour carries one label. It says how the simulator knows it.</p>
+      <table>
+        <thead><tr><th>Label</th><th>Meaning</th><th>Entries in the evidence register</th></tr></thead>
+        <tbody>
+          {LABELS.map((l) => (
+            <tr key={l}><td><Chip label={l} /></td><td>{LABEL_MEANING[l]}</td><td className="mono faint">{Object.values(EVIDENCE).filter((e) => e.label === l).length}</td></tr>
+          ))}
+        </tbody>
+      </table>
+      <p>Labels appear on knobs, sequence steps, invariants, schema fields and transaction type names. The Evidence panel lists the entries the current state rests on.</p>
 
       <h3>Reading the sequence diagram</h3>
       <ul>
-        <li>Each <strong>column</strong> is a module or the database. Hover a column name to see what it stands for in the backend.</li>
-        <li>A <strong>solid arrow</strong> is a call, a <strong>dashed arrow</strong> is what comes back, a <strong>red arrow</strong> is a failure, and a <strong>box</strong> is a note about what happened inside one participant.</li>
-        <li><strong>Hover a step</strong> for a plain-language explanation of what it does and why, plus the data it carries.</li>
-        <li><strong>Click a step</strong> to pin it under the diagram with its full payload. This is the way to read a whole pipeline.</li>
-        <li>Steps run top to bottom. When two requests are in flight together, their steps are interleaved in the order they would hit the database.</li>
+        <li>Only the participants of the last operation are shown. Hover a column name for what it is in the backend.</li>
+        <li>A solid arrow is a call. A dashed arrow is a return. A red arrow is a failure. A box is a note inside one participant.</li>
+        <li>Hover a step for why it happens and the evidence behind it. Click it to pin its full payload.</li>
+        <li>When two requests are in flight together, their steps are interleaved in the order they reach the database.</li>
       </ul>
 
-      <h3>Presets and knobs</h3>
+      <h3>The matrix statuses</h3>
+      <p>The Test scenarios tab runs {SCENARIOS.length} scenarios under each preset, once per balance type (cash for RethinkDB, usdt for Mongo). Each scenario stores the result the documents imply before it runs.</p>
       <table>
-        <thead><tr><th>Preset</th><th>What it is</th></tr></thead>
-        <tbody>{Object.entries(PRESETS).map(([k, p]) => <tr key={k}><td><strong>{p.label}</strong></td><td>{p.blurb}</td></tr>)}</tbody>
-      </table>
-      <p>A preset is a set of five design decisions. “Show design knobs” lets you change one at a time and see which rule or scenario it affects.</p>
-      <table>
-        <thead><tr><th>Knob</th><th>Choices</th></tr></thead>
-        <tbody>{Object.entries(KNOBS).map(([k, knob]) => <tr key={k}><td><strong>{knob.label}</strong></td><td>{Object.values(knob.options).join(' · ')}</td></tr>)}</tbody>
-      </table>
-
-      <h3>The rules (invariants)</h3>
-      <p>The simulator keeps its own record of what each balance <em>should</em> be if every operation was applied exactly once. After every action it compares that with what the ledger stored and wrote.</p>
-      <table>
-        <thead><tr><th>Rule</th><th>Meaning</th><th>Turns red when</th></tr></thead>
+        <thead><tr><th>Status</th><th>Meaning</th></tr></thead>
         <tbody>
-          <tr><td>Conservation</td><td>Primary + bonus equals the expected total</td><td>A callback is applied twice</td></tr>
-          <tr><td>No negative balance</td><td>Nothing is below zero unless allowNegative was used</td><td>Two requests both pass a check done outside the database</td></tr>
-          <tr><td>Latest row ↔ balance</td><td>The newest row of a bucket shows its real balance</td><td>A row is missing or was computed from a stale read</td></tr>
-          <tr><td>Every change has a row</td><td>The rows of a bucket add up to its balance</td><td>A row insert fails after the balance changed</td></tr>
-          <tr><td>Each callback applied once</td><td>No callback has two rows</td><td>A duplicate gets past the duplicate check</td></tr>
-          <tr><td>No float residue</td><td>Amounts are exact decimals</td><td>Doubles produce a value like 0.7999999999999999</td></tr>
+          {STATUS_MEANING.map(([s, text]) => <tr key={s}><td><span className={`pill ${STATUS_CLASS[s]}`}>{s}</span></td><td>{text}</td></tr>)}
         </tbody>
       </table>
-
-      <h3>How concurrency and faults are simulated</h3>
-      <ul>
-        <li><strong>Two requests at once</strong>: a balance change is split into a first half (the read, or the whole atomic update) and a second half (the write and the rows). The simulator runs both first halves, then both second halves. With the atomic update the second request already sees the first one’s result; with read-then-write both see the old balance.</li>
-        <li><strong>Replay last callback</strong>: sends the last deposit, bet, win or refund again with the same identifier, as a provider retry would.</li>
-        <li><strong>Fail the next transaction insert</strong>: the next row insert fails once, after its balance update has succeeded.</li>
-        <li><strong>Time</strong>: each action advances the clock by one second. The +days buttons jump ahead, which expires bonuses (7 days) and transaction rows (180 days).</li>
-      </ul>
+      <p>Below the matrix are {STASH_SCENARIOS.length} Stash scenarios and {MIGRATION_SCENARIOS.length} migration cases. Click any result for its notes. “Load into simulator” opens that cell’s end state.</p>
 
       <h3>The other tabs</h3>
       <ul>
-        <li><strong>Database</strong>: where each amount is stored, the schemas from the study, the live documents, and the pipeline of the last balance update.</li>
-        <li><strong>Test scenarios</strong>: {SCENARIOS.length} scripted cases, each run on a fresh user against every preset. The first ten are the study’s own (§7.3). Click a result, then “Load into simulator” to open that case’s end state and inspect it.</li>
+        <li><strong>Database</strong>: both stores’ schemas, the stored documents, the frozen <code>transactions</code> collection, the type names, and the last update.</li>
+        <li><strong>Migration</strong>: a separate small model of moving one legacy type from RethinkDB to Mongo. The plan is in progress. The safeguards are proposals.</li>
       </ul>
 
       <h3>What to keep in mind</h3>
-      <p>The simulator was built from the study, not from the backend source. Where the study is silent it makes a choice, and those choices are listed in <code>README.md</code> and <code>SIMULATION_EXPLAINED.md</code>. The Hardened preset is a set of proposals, not something the study describes.</p>
+      <ul>
+        <li>Invariants marked simulator-only compare with a ground truth that production does not have.</li>
+        <li>Each action advances the clock by one second. “Next action arrives after N ms” changes that once.</li>
+        <li>Transaction type names marked Assumed are not confirmed. They live in one table, <code>TX_TYPES</code>.</li>
+        <li>The bonus rules (5× within 7 days) are placeholders.</li>
+      </ul>
     </div>
   );
 }
